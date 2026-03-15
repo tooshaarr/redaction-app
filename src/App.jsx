@@ -1,6 +1,7 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, rgb } from 'pdf-lib';
+import JSZip from 'jszip';
 
 // Set up PDF.js worker
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -12,13 +13,33 @@ export default function RedactionTool() {
   const [imageSrc, setImageSrc] = useState(null);
   const [pdfPages, setPdfPages] = useState([]);
   const [currentPage, setCurrentPage] = useState(0);
-  const [redactions, setRedactions] = useState([]);
+  // ── FIX #1: Per-page redactions & history ──
+  // Instead of a flat array, store redactions keyed by page index:
+  //   { 0: [rect, rect], 1: [rect], ... }
+  const [allRedactions, setAllRedactions] = useState({});
+  const [allHistory, setAllHistory] = useState({});
+  const [allHistoryIndex, setAllHistoryIndex] = useState({});
   const [isDrawing, setIsDrawing] = useState(false);
   const [startPos, setStartPos] = useState(null);
-  const [history, setHistory] = useState([]);
-  const [historyIndex, setHistoryIndex] = useState(-1);
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
+
+  // Convenience accessors for the current page's data
+  const redactions = allRedactions[currentPage] || [];
+  const history = allHistory[currentPage] || [];
+  const historyIndex = allHistoryIndex[currentPage] ?? -1;
+
+  const setRedactions = useCallback((newReds) => {
+    setAllRedactions(prev => ({ ...prev, [currentPage]: newReds }));
+  }, [currentPage]);
+
+  const setHistory = useCallback((newHist) => {
+    setAllHistory(prev => ({ ...prev, [currentPage]: newHist }));
+  }, [currentPage]);
+
+  const setHistoryIndex = useCallback((newIdx) => {
+    setAllHistoryIndex(prev => ({ ...prev, [currentPage]: newIdx }));
+  }, [currentPage]);
 
   // Handle file upload
   const handleFileUpload = async (e) => {
@@ -34,9 +55,9 @@ export default function RedactionTool() {
 
     setFile(uploadedFile);
     setFileType(fileExtension);
-    setRedactions([]);
-    setHistory([]);
-    setHistoryIndex(-1);
+    setAllRedactions({});
+    setAllHistory({});
+    setAllHistoryIndex({});
     setCurrentPage(0);
 
     if (fileExtension === 'pdf') {
@@ -91,7 +112,7 @@ export default function RedactionTool() {
       canvas.height = img.height;
       ctx.drawImage(img, 0, 0);
 
-      // Draw all redaction boxes
+      // Draw all redaction boxes for the current page
       redactions.forEach(rect => {
         ctx.fillStyle = 'black';
         ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
@@ -205,56 +226,117 @@ export default function RedactionTool() {
     }
   };
 
-
-
-  // Download as PNG
-  const downloadAsPNG = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const originalName = file.name.replace(/\.[^/.]+$/, ''); // Remove extension
-    const link = document.createElement('a');
-    link.download = `${originalName}_redacted.png`;
-    link.href = canvas.toDataURL('image/png');
-    link.click();
+  // ── Helper: render a page image with its redactions onto an offscreen canvas ──
+  const renderPageWithRedactions = (pageDataUrl, pageRedactions) => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const offscreen = document.createElement('canvas');
+        offscreen.width = img.width;
+        offscreen.height = img.height;
+        const ctx = offscreen.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        (pageRedactions || []).forEach(r => {
+          ctx.fillStyle = 'black';
+          ctx.fillRect(r.x, r.y, r.width, r.height);
+        });
+        resolve(offscreen);
+      };
+      img.src = pageDataUrl;
+    });
   };
 
-  // Download as PDF
+  // Download as PNG — single image direct download, multi-page as a ZIP
+  const downloadAsPNG = async () => {
+    if (!imageSrc) return;
+
+    const originalName = file.name.replace(/\.[^/.]+$/, '');
+
+    if (pdfPages.length <= 1) {
+      // Single image: direct PNG download
+      const canvas = await renderPageWithRedactions(imageSrc, redactions);
+      const link = document.createElement('a');
+      link.download = `${originalName}_redacted.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    } else {
+      // Multi-page: bundle all pages into a ZIP
+      const zip = new JSZip();
+      const folder = zip.folder(`${originalName}_redacted`);
+
+      for (let i = 0; i < pdfPages.length; i++) {
+        const pageRedactions = allRedactions[i] || [];
+        const canvas = await renderPageWithRedactions(pdfPages[i], pageRedactions);
+        // Convert data URL to raw base64
+        const dataUrl = canvas.toDataURL('image/png');
+        const base64 = dataUrl.split(',')[1];
+        folder.file(`page_${i + 1}.png`, base64, { base64: true });
+      }
+
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `${originalName}_redacted_pages.zip`;
+      link.click();
+    }
+  };
+
+  // ── FIX #2: Download ALL pages as a single PDF ──
   const downloadAsPDF = async () => {
-    if (!canvasRef.current) return;
+    if (!imageSrc) return;
 
     const pdfDoc = await PDFDocument.create();
-    const canvas = canvasRef.current;
-    
-    const pngImageBytes = canvas.toDataURL('image/png');
-    const pngImage = await pdfDoc.embedPng(pngImageBytes);
-    const page = pdfDoc.addPage([canvas.width, canvas.height]);
-    
-    page.drawImage(pngImage, {
-      x: 0,
-      y: 0,
-      width: canvas.width,
-      height: canvas.height,
-    });
+    const originalName = file.name.replace(/\.[^/.]+$/, '');
+
+    if (pdfPages.length > 0) {
+      // Multi-page PDF: iterate every page
+      for (let i = 0; i < pdfPages.length; i++) {
+        const pageRedactions = allRedactions[i] || [];
+        const canvas = await renderPageWithRedactions(pdfPages[i], pageRedactions);
+        const pngDataUrl = canvas.toDataURL('image/png');
+        const pngImage = await pdfDoc.embedPng(pngDataUrl);
+        const page = pdfDoc.addPage([canvas.width, canvas.height]);
+        page.drawImage(pngImage, {
+          x: 0,
+          y: 0,
+          width: canvas.width,
+          height: canvas.height,
+        });
+      }
+    } else {
+      // Single image: same as before
+      const canvas = await renderPageWithRedactions(imageSrc, redactions);
+      const pngDataUrl = canvas.toDataURL('image/png');
+      const pngImage = await pdfDoc.embedPng(pngDataUrl);
+      const page = pdfDoc.addPage([canvas.width, canvas.height]);
+      page.drawImage(pngImage, {
+        x: 0,
+        y: 0,
+        width: canvas.width,
+        height: canvas.height,
+      });
+    }
 
     const pdfBytes = await pdfDoc.save();
     const blob = new Blob([pdfBytes], { type: 'application/pdf' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    
-    const originalName = file.name.replace(/\.[^/.]+$/, ''); // Remove extension
     link.download = `${originalName}_redacted.pdf`;
     link.click();
   };
 
-  // Change page for multi-page PDFs
+  // ── FIX #1 continued: changePage no longer clears redactions ──
   const changePage = (pageIndex) => {
     setCurrentPage(pageIndex);
     setImageSrc(pdfPages[pageIndex]);
-    setRedactions([]);
-    setHistory([]);
-    setHistoryIndex(-1);
+    // Redactions, history, historyIndex are now derived from allRedactions[pageIndex]
+    // automatically via the convenience accessors — nothing to clear!
   };
+
+  // Count total redactions across all pages
+  const totalRedactions = Object.values(allRedactions).reduce(
+    (sum, arr) => sum + (arr ? arr.length : 0), 0
+  );
 
   return (
     <div style={{
@@ -546,7 +628,7 @@ export default function RedactionTool() {
                 onClick={downloadAsPNG}
                 className="btn btn-primary"
               >
-                ⬇ Download PNG
+                ⬇ Download {pdfPages.length > 1 ? 'PNGs (ZIP)' : 'PNG'}
               </button>
               <button
                 onClick={downloadAsPDF}
@@ -567,7 +649,11 @@ export default function RedactionTool() {
               textAlign: 'center',
               border: '1px solid var(--border-color)'
             }}>
-              <strong style={{ color: 'var(--text-color)' }}>Current Session:</strong> {redactions.length} redaction{redactions.length !== 1 ? 's' : ''} • {fileType?.toUpperCase()}
+              <strong style={{ color: 'var(--text-color)' }}>Current Page:</strong> {redactions.length} redaction{redactions.length !== 1 ? 's' : ''}
+              {pdfPages.length > 1 && (
+                <> &nbsp;•&nbsp; <strong style={{ color: 'var(--text-color)' }}>All Pages:</strong> {totalRedactions} total</>
+              )}
+              &nbsp;•&nbsp; {fileType?.toUpperCase()}
             </div>
           </div>
         )}
